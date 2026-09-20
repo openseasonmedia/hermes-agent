@@ -159,6 +159,14 @@ def _title_language() -> str:
 
 
 def _auto_title_enabled() -> bool:
+    # Dispatcher-owned Referee reviews are headless task workers. Generating a chat
+    # title buys nothing there and can race the primary call for a rate-limited
+    # provider credential (notably free-tier review models).
+    if (
+        (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        and (os.environ.get("HERMES_PROFILE") or "").strip().lower() == "referee"
+    ):
+        return False
     try:
         from utils import is_truthy_value
         return is_truthy_value(_title_config().get("enabled"), default=True)
