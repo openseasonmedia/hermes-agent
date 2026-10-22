@@ -73,3 +73,18 @@ def check_config_version(*, raise_on_parse_error: bool = False) -> tuple[int, in
     be mistaken for an up-to-date config. A file with no version key reads as 0."""
     stamp, latest = read_config_version_stamp(raise_on_parse_error=raise_on_parse_error)
     return (0 if stamp is None else stamp), latest
+
+
+def note_first_stamp(home, on_disk: dict, to_write: dict) -> None:
+    """``save_config`` is about to give *home*'s config.yaml (*on_disk*: missing or never stamped) its first
+    ``_config_version`` outside a migration, so the steps up to that version never see this home. Record
+    the left-core rows they would have found in use (``left_core_migration.record_core_use``) into
+    *to_write*, or the stamp would make a home that ran the core feature look newer than the split."""
+    if "_config_version" in on_disk or "_config_version" not in to_write:
+        return
+    from agent.safe_worker_policy import worker_config_snapshot
+    if worker_config_snapshot() is not None:
+        return  # a frozen worker never reads the profile's files; its owner migrates the home
+    from hermes_cli.left_core_migration import LEFT_CORE, record_core_use
+    for version in sorted({feature.left_at for feature in LEFT_CORE if feature.left_at}):
+        record_core_use(home, to_write, version)

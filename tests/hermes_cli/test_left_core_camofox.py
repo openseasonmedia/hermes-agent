@@ -245,6 +245,35 @@ def test_home_from_after_the_split_keeps_browser_exec(tmp_path, monkeypatch, sta
     assert (home / "config.yaml").read_bytes() == before
 
 
+@pytest.mark.parametrize("config", [None, {"platform_toolsets": _SPLIT_TOOLSETS}], ids=["no-config", "unstamped"])
+def test_an_unversioned_camofox_home_is_converted(tmp_path, monkeypatch, config):
+    """Main ran Camofox for a home with no config.yaml (CAMOFOX_URL in .env alone) or an unstamped one, and
+    Hermes always stamps a config.yaml it creates: such a home ran the core feature and is converted."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "launch"))
+    home = _home(tmp_path, env=_SPLIT_ENV, config=config)
+    calls = []
+    assert lcm.migrate_home(home, install=_installer(home, calls), say=lambda _m: None) == ["camofox"]
+    assert _config(home)["agent"]["disabled_toolsets"] == ["browser"]
+
+
+def test_a_plain_save_stamping_an_unversioned_camofox_home_keeps_its_conversion(tmp_path, monkeypatch):
+    """Any config write before the first left-core pass (`hermes config set`, a model switch) stamps an
+    unstamped config.yaml at the current version without running the v52 step; the home still converts."""
+    from hermes_cli.config import load_config, save_config
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "launch"))
+    home = _home(tmp_path, env=_SPLIT_ENV, config={"platform_toolsets": _SPLIT_TOOLSETS})
+    token = set_hermes_home_override(home)
+    try:
+        save_config(load_config())
+    finally:
+        reset_hermes_home_override(token)
+    assert _config(home)["_config_version"] == 52
+    calls = []
+    assert lcm.migrate_home(home, install=_installer(home, calls), say=lambda _m: None) == ["camofox"]
+    assert _config(home)["platform_toolsets"]["cli"] == ["terminal", "file", "camofox"]
+
+
 def test_catalog_miss_names_the_install_command(tmp_path, _fresh):
     (_fresh / "camofox.yaml").unlink()
     home = _home(tmp_path, env="CAMOFOX_URL=http://localhost:9377\n", config={"_config_version": 51})

@@ -450,16 +450,18 @@ def record_core_use(home: Path, config: dict, version: int) -> bool:
 
 def _predates_split(home: Path, feature: LeftCoreFeature) -> bool:
     """*home* ran *feature* in core: its config is still below ``left_at`` (this pass ran before the
-    config step), or that step recorded the feature in use. A missing or unstamped config.yaml is
-    neither: the config step stamps (and records) an unstamped one, a missing one is a new home."""
+    config step), that step recorded the feature in use, or config.yaml is missing or unstamped. Every
+    config.yaml Hermes writes carries a stamp, and the first save that stamps one records the rows in use
+    (``config_version_stamp.note_first_stamp``), so only a home from before the split lacks it; core ran
+    the feature there from its .env alone."""
     if not feature.left_at:
         return True
     config = _read_config(home)
-    if _marked(config, _USED_KEY, feature):
+    if _marked(config, _USED_KEY, feature) or "_config_version" not in config:
         return True
     try:
         return int(config["_config_version"]) < feature.left_at
-    except (KeyError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return False
 
 
