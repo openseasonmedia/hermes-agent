@@ -274,6 +274,23 @@ def test_a_plain_save_stamping_an_unversioned_camofox_home_keeps_its_conversion(
     assert _config(home)["platform_toolsets"]["cli"] == ["terminal", "file", "camofox"]
 
 
+def test_a_stamped_camofox_home_without_the_plugin_is_told_where_it_went(tmp_path, monkeypatch):
+    """A Nix-managed config.yaml carries the package's stamp (52) from activation, so neither the stamp nor
+    the v52 step shows this home ran core's Camofox. It is told where Camofox went (once per backoff window
+    at start) and nothing about it changes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "launch"))
+    home = _home(tmp_path, env=_SPLIT_ENV, config={"_config_version": 52, "platform_toolsets": _SPLIT_TOOLSETS})
+    before = (home / "config.yaml").read_bytes()
+    said = []
+    assert lcm.migrate_home(home, install=lambda name: pytest.fail("nothing is installed"), say=said.append) == []
+    assert len(said) == 1
+    assert "Camofox browser backend moved out of core" in said[0] and "hermes plugins install camofox" in said[0]
+    assert (home / "config.yaml").read_bytes() == before
+
+    assert lcm._pending(home, say=said.append, backoff=True) == []
+    assert len(said) == 1, "a start inside the backoff window repeats nothing"
+
+
 def test_catalog_miss_names_the_install_command(tmp_path, _fresh):
     (_fresh / "camofox.yaml").unlink()
     home = _home(tmp_path, env="CAMOFOX_URL=http://localhost:9377\n", config={"_config_version": 51})

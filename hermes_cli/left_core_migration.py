@@ -555,7 +555,10 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
     for feature in LEFT_CORE:
         if _marked(_read_config(home), _INSTALLED_KEY, feature):
             continue
-        if not _predates_split(home, feature) or not feature.in_use(home, process_env=process_env):
+        if not feature.in_use(home, process_env=process_env):
+            continue
+        if not _predates_split(home, feature):
+            _say_post_split(home, feature, say=say, backoff=backoff)
             continue
         present = plugin_present(feature.plugin, home)
         try:
@@ -579,6 +582,17 @@ def _pending(home: Path, *, say: Callable[[str], None], process_env: bool = Fals
             continue
         out.append(feature)
     return out
+
+
+def _say_post_split(home: Path, feature: LeftCoreFeature, *, say: Callable[[str], None], backoff: bool) -> None:
+    """*home* uses *feature* while its stamp says it never ran it in core (a newer home, or a Nix-managed
+    config.yaml stamped at activation): nothing is converted or installed, but a home without the plugin is
+    told where the feature went. Starts repeat it on the install backoff (``_note_failure``)."""
+    if plugin_present(feature.plugin, home) or (backoff and _failed_recently(home, feature.plugin)):
+        return
+    _note_failure(home, feature.plugin)
+    say(f"  ⚠ {feature.label} moved out of core into the '{feature.plugin}' plugin, which this profile does not "
+        f"have, so it is off. Run `{_install_command(feature.plugin, home)}`.")
 
 
 def _install_into(home: Path, *, consent: Optional[bool] = None) -> Callable[[str], dict]:
