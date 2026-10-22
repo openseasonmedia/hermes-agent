@@ -898,3 +898,25 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+def test_dispatcher_owned_referee_worker_skips_auto_title(monkeypatch):
+    from agent.title_generator import _auto_title_enabled
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_referee_review")
+    monkeypatch.setenv("HERMES_PROFILE", "referee")
+    assert _auto_title_enabled() is False
+
+
+def test_non_referee_or_interactive_session_keeps_title_config(monkeypatch):
+    from agent.title_generator import _auto_title_enabled
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "referee")
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        assert _auto_title_enabled() is True
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_clockwork")
+    monkeypatch.setenv("HERMES_PROFILE", "clockwork")
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        assert _auto_title_enabled() is True
