@@ -32,6 +32,45 @@ if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
 
+def _terminal_signature(outcome: str, error: Optional[str]) -> str:
+    """Compute the family-keyed feasibility-guard terminal signature.
+
+    Runs 8-12 taxonomy (verbatim label classes); detection is calibrated
+    against the actual task_runs.error text observed in the live DB:
+    - timed_out:elapsed>cap      outcome='timed_out', err matches 'elapsed <N>s > limit'
+    - timed_out:iteration_budget outcome='timed_out', err mentions 'iteration ... budget'
+    - gave_up:iteration_budget   outcome='gave_up',   err mentions 'iteration ... budget'
+    - crashed:watchdog           outcome='crashed',   err mentions 'watchdog'
+    - otherwise falls back to the outcome-only '<outcome>:<errclass>'.
+    """
+    import re as _re
+    err = (error or "").lower()
+    if outcome == "timed_out":
+        if _re.search(r"elapsed\s*\d+\s*s?\s*>\s*limit", err) or "elapsed>cap" in err:
+            return "timed_out:elapsed>cap"
+        if "iteration" in err and "budget" in err:
+            return "timed_out:iteration_budget"
+    elif outcome == "gave_up":
+        if "iteration" in err and "budget" in err:
+            return "gave_up:iteration_budget"
+    elif outcome == "crashed":
+        if "watchdog" in err:
+            return "crashed:watchdog"
+    return f"{outcome}:<errclass>"
+
+
+def _title_family_slug(title: str) -> str:
+    """Default feasibility-guard family derived from a card title.
+
+    Used when the task's ``strategy_family`` column is NULL: the dispatcher
+    slugs the title so same-titled cards (and their retries) share one family
+    bucket for the 2-attempt stop accounting.
+    """
+    import re as _re
+    slug = _re.sub(r"[^a-z0-9]+", "_", (title or "").lower()).strip("_")
+    return slug[:48] or "untitled"
+
+
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
