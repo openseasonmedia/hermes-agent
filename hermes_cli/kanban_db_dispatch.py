@@ -71,6 +71,61 @@ def _title_family_slug(title: str) -> str:
     return slug[:48] or "untitled"
 
 
+def _family_keyed_feasibility_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    family: str,
+    *,
+    dry_run: bool,
+    result: DispatchResult,
+) -> Optional[str]:
+    """Family-keyed feasibility guard — run-14 pins the run-13 design.
+
+    Distinct from the respawn guard: keyed on (task_id, family), not
+    profile, and keyed on the run-8 terminal-signature classification
+    rather than the taxonomy's literal labels — 'elapsed <N>s > limit'
+    maps to elapsed>cap (a cap-miss, not a crash), 'iteration budget'
+    maps to iteration_budget, 'exit-code 0' maps to exit_0 (a clean exit
+    the breaker must NOT count as a failure). Fires on the SECOND
+    consecutive non-success run in the same family (the FIRST is still a
+    legitimate attempt; one clean tick is the run-13 ADJUST_POLICY
+    evidence the guard exists to protect).
+
+    Returns the guard reason (the card is not respawned this tick) or
+    None (respawn proceeds). ``dry_run`` only appends the guarded event +
+    the ``result.respawn_guarded`` entry; no comment.
+    """
+    # Rule 5: an explicit operator FEASIBILITY_WAIVER comment on the card
+    # suppresses the guard for that family.
+    try:
+        comments = _kb.list_comments(conn, task_id)
+    except Exception:
+        comments = []
+    if any("FEASIBILITY_WAIVER" in (getattr(c, "body", "") or "") for c in comments):
+        return None
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM task_runs "
+        "WHERE task_id = ? AND family = ? AND terminal_signature = ?",
+        (task_id, family, family),
+    ).fetchone()
+    if row is None or row["cnt"] < 2:
+        return None
+    auto_comment = (
+        f"feasibility guard (family={family}): {row['cnt']} consecutive runs "
+        f"ended in the same terminal bucket (run-8 signature "
+        f"'{family}'); no respawn this tick — a clean tick or an explicit "
+        f"FEASIBILITY_WAIVER comment releases it. See run-14."
+    )
+    if not dry_run:
+        with _kb.write_txn(conn, allow_nested=True):
+            _kb._append_event(
+                conn, task_id, "feasibility_guarded", {"reason": auto_comment},
+            )
+        _kb.add_comment(conn, task_id, "feasibility-guard", auto_comment)
+    result.respawn_guarded.append((task_id, auto_comment))
+    return auto_comment
+
+
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
@@ -1456,6 +1511,29 @@ def _record_task_failure(
         )
         failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
 
+        # Family-keyed feasibility guard population (run-14): stamp the run
+        # with its family + terminal signature so the guard can count
+        # repeated same-family non-success runs. family = the card's
+        # strategy_family (or the card-title slug fallback); the
+        # terminal_signature column mirrors the family so the guard's count
+        # key is (task_id, family).
+        try:
+            _prow = conn.execute(
+                "SELECT strategy_family, title FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            _pfam = (
+                _prow["strategy_family"]
+                if _prow is not None and _prow["strategy_family"]
+                else _title_family_slug((_prow["title"] if _prow is not None else "") or "")
+            )
+            if row["current_run_id"] is not None:
+                conn.execute(
+                    "UPDATE task_runs SET family=?, terminal_signature=? "
+                    "WHERE id=?", (_pfam, _pfam, row["current_run_id"]),
+                )
+        except Exception:
+            pass
+
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
         if task_override is not None:
@@ -2151,6 +2229,39 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+
+    # Family-keyed feasibility guard (run-13 delta; run-14 pins). Distinct
+    # from the respawn guard above: keyed on (task_id, family) and the run-8
+    # terminal-signature classification. Fires on the SECOND consecutive
+    # non-success run in the same family. The family is the card's
+    # strategy_family (or the card-title slug fallback).
+    try:
+        _fam_row = conn.execute(
+            "SELECT strategy_family, title FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        _family = (
+            _fam_row["strategy_family"]
+            if _fam_row is not None and _fam_row["strategy_family"]
+            else _title_family_slug((_fam_row["title"] if _fam_row is not None else "") or "")
+        )
+    except Exception:
+        _family = None
+    if _family is not None:
+        feasibility_reason = _family_keyed_feasibility_guard(
+            conn, task_id, _family,
+            dry_run=dry_run,
+            result=result,
+        )
+        if feasibility_reason:
+            with _kb.write_txn(conn, allow_nested=True):
+                _kb._append_event(
+                    conn, task_id, "dispatch_skipped",
+                    {"reason": feasibility_reason},
+                )
+            if not dry_run:
+                _kb.add_comment(conn, task_id, "feasibility-guard", feasibility_reason)
+            result.respawn_guarded.append((task_id, feasibility_reason))
+            return False
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent

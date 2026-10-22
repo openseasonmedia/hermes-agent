@@ -887,6 +887,9 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Family-keyed feasibility guard (run-13 delta, rule 1): the card's declared
+    # feasibility-invariant family; NULL = the card-title slug is the default.
+    ("strategy_family", "strategy_family TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -905,6 +908,11 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Family-keyed feasibility guard (run-13 delta, rule 2): this run's card family
+    # + its normalized terminal signature, so the guard can count consecutive
+    # non-successes within a family (NULL = pre-guard run).
+    ("family", "family TEXT"),
+    ("terminal_signature", "terminal_signature TEXT"),
 )
 
 
