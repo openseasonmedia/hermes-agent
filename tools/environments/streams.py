@@ -170,6 +170,9 @@ class PortForward:
         self._server.listen(16)
         self.local_port: int = self._server.getsockname()[1]
         self._closed = False
+        # Connections that never reached the target (relay not started, or it exited non-zero before
+        # relaying a byte back): the one cheap signal that whatever listened there may be gone.
+        self.failures = 0
         threading.Thread(target=self._accept_loop, name=f"port-forward-{self.local_port}", daemon=True).start()
 
     def _accept_loop(self) -> None:
@@ -186,6 +189,7 @@ class PortForward:
                                user=self.user)
         except Exception:
             conn.close()
+            self.failures += 1
             return
 
         def to_remote() -> None:
@@ -205,11 +209,13 @@ class PortForward:
                     pass
 
         threading.Thread(target=to_remote, daemon=True).start()
+        relayed = False
         try:
             while True:
                 data = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(65536)
                 if not data:
                     break
+                relayed = True
                 conn.sendall(data)
         except OSError:
             pass
@@ -217,6 +223,8 @@ class PortForward:
             try:
                 conn.close()
             finally:
+                if not relayed and _exited_nonzero(proc):
+                    self.failures += 1
                 proc.kill()
 
     def close(self) -> None:
@@ -225,6 +233,21 @@ class PortForward:
             self._server.close()
         except OSError:
             pass
+
+
+def _exited_nonzero(proc: subprocess.Popen) -> bool:
+    try:
+        return proc.wait(timeout=2) != 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def forward_failures(env: BaseEnvironment, remote_port: int, *, remote_host: str = "127.0.0.1") -> int:
+    """How many connections through ``forward_port(env, remote_port)`` never reached the target (0 while no
+    forward is open). A caller caching "the target is up" re-checks only once this changes."""
+    with _forwards_lock:
+        fwd = _forwards.get((id(env), remote_host, int(remote_port)))
+    return fwd.failures if fwd is not None else 0
 
 
 def forward_port(env: BaseEnvironment, remote_port: int, *, remote_host: str = "127.0.0.1",

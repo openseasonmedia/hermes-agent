@@ -1,6 +1,7 @@
 """Regression tests for browser session cleanup (tools/browser_session_lifecycle.py)."""
 
 import os
+import subprocess
 import sys
 from unittest.mock import patch
 
@@ -225,14 +226,23 @@ class _FakeSandbox:
     def __init__(self):
         self.running = None
         self.killed = []
+        self.probes = 0  # liveness execs (the /dev/tcp check)
+        self.probe_failure = None  # "exit-255" (docker/ssh transport error) or "timeout"
+        self.forward_failures = 0  # connections through the port forward that never reached Chromium
 
     def run_in(self, env, argv, **kw):
         cmd = " ".join(argv)
         if "setsid" in cmd:
             self.running = 4242
             return _Completed(0, b"4242\n")
+        if "/dev/tcp" in cmd:
+            self.probes += 1
+            if self.probe_failure == "exit-255":
+                return _Completed(255)
+            if self.probe_failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
         if "/dev/tcp" in cmd or argv[0] == "cat":
-            return _Completed(0, b"9222\n/devtools/browser/abc\n") if self.running else _Completed(1)
+            return _Completed(0, b"9222\n/devtools/browser/abc\n") if self.running else _Completed(3)
         if argv[0] == "kill":
             self.killed.append(int(argv[-1]))
             self.running = None
@@ -252,8 +262,10 @@ def fake_sandbox(monkeypatch, isolated_sessions):
     from tools.environments import streams
     sandbox, env = _FakeSandbox(), object()
     monkeypatch.setattr(browser_session_sandbox, "_launched", {}, raising=False)
+    monkeypatch.setattr(browser_session_sandbox, "_confirmed", {}, raising=False)
     monkeypatch.setattr(streams, "run_in", sandbox.run_in)
     monkeypatch.setattr(streams, "forward_port", lambda env, port, user=None: 50000 + port)
+    monkeypatch.setattr(streams, "forward_failures", lambda env, port: sandbox.forward_failures, raising=False)
     monkeypatch.setattr(streams, "sandbox_temp_dir", lambda env: "/tmp")  # no-tmp: ok — sandbox-side path
     monkeypatch.setattr(runtime, "_sandbox_env", lambda create=False: env)
     monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":5"})
@@ -284,4 +296,28 @@ class TestSandboxSharedBrowser:
         assert bs._backend_dead(info) is False
 
         fake_sandbox.running = None  # crashed inside the sandbox
+        fake_sandbox.forward_failures += 1  # the harness's next connection through the forward fails
         assert bs._backend_dead(info) is True
+
+    def test_a_failed_or_timed_out_liveness_exec_keeps_the_live_browser(self, fake_sandbox, isolated_sessions,
+                                                                      monkeypatch):
+        """Only a definitive answer from inside the sandbox ("no DevTools port file", "port closed") means
+        Chromium is gone; a docker/ssh exec that fails or times out says nothing about it."""
+        from tools.browser_session_sandbox import create_sandbox_session
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, force_local: create_sandbox_session(key))
+        first = bs.get_session_info("task-A")
+        for failure in ("exit-255", "timeout"):
+            fake_sandbox.forward_failures += 1  # a connection through the forward failed: liveness is re-checked
+            fake_sandbox.probe_failure = failure
+            assert bs.get_session_info("task-A") is first, failure
+        assert fake_sandbox.killed == [] and fake_sandbox.running == 4242
+
+    def test_a_healthy_sandbox_session_spends_no_exec_per_browser_call(self, fake_sandbox, isolated_sessions,
+                                                                     monkeypatch):
+        from tools.browser_session_sandbox import create_sandbox_session
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, force_local: create_sandbox_session(key))
+        first = bs.get_session_info("task-A")
+        fake_sandbox.probes = 0
+        for _ in range(5):
+            assert bs.get_session_info("task-A") is first
+        assert fake_sandbox.probes == 0

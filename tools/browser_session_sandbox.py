@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+import subprocess
 import threading
 import time
 from typing import Any, Optional
@@ -23,6 +24,14 @@ _LAUNCH_TIMEOUT_S = 60.0
 # right sandbox.
 _launched: dict[str, tuple[Any, int]] = {}
 _launched_lock = threading.Lock()
+# Endpoints a liveness probe confirmed: ``cdp_url -> (id(env), sandbox port, forward failures then)``. A browser
+# call re-probes only after a connection through its forward failed (or the sandbox was replaced), so a
+# healthy call spends no exec in the sandbox.
+_confirmed: dict[str, tuple[int, int, int]] = {}
+# Exit code of the liveness script when the sandbox answers "not running": no DevTools port file, or nothing
+# listens on its port. Any other failure (docker/ssh transport error, timeout) says nothing about Chromium.
+_GONE_RC = 3
+GONE = "gone"
 
 
 def _sandbox():
@@ -47,16 +56,25 @@ def _read_devtools(env, user, udd: str) -> Optional[tuple[int, str]]:
     return None
 
 
-def _live_devtools(env, user, udd: str) -> Optional[tuple[int, str]]:
-    """``(port, path)`` of the Chromium on ``udd`` while its DevTools port still answers, in one exec (a
-    crashed Chromium leaves a stale ``DevToolsActivePort`` behind)."""
+def _live_devtools(env, user, udd: str):
+    """One exec: ``(port, path)`` of the Chromium on ``udd`` while its DevTools port answers; ``GONE`` when the
+    sandbox says it is not running (a crashed Chromium leaves a stale ``DevToolsActivePort`` behind); None
+    when the exec itself failed or timed out, which proves nothing either way."""
     from tools.environments import streams
     active = shlex.quote(f"{udd}/DevToolsActivePort")
-    script = f'p=$(head -n1 {active}) && exec 3<>"/dev/tcp/127.0.0.1/$p" && cat {active}'
-    proc = streams.run_in(env, ["bash", "-c", script], user=user, timeout=10)
+    script = (f'[ -s {active} ] || exit {_GONE_RC}; p=$(head -n1 {active}); '
+              f'( exec 3<>"/dev/tcp/127.0.0.1/$p" ) 2>/dev/null || exit {_GONE_RC}; cat {active}')
+    try:
+        proc = streams.run_in(env, ["bash", "-c", script], user=user, timeout=10)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        logger.debug("sandbox browser liveness probe failed: %s", exc)
+        return None
+    if proc.returncode == _GONE_RC:
+        return GONE
     lines = proc.stdout.decode("utf-8", "replace").splitlines() if proc.returncode == 0 else []
     if len(lines) >= 2 and lines[0].strip().isdigit() and lines[1].startswith("/devtools/browser/"):
         return int(lines[0].strip()), lines[1].strip()
+    logger.debug("sandbox browser liveness probe inconclusive (exit %s)", proc.returncode)
     return None
 
 
@@ -106,6 +124,9 @@ def create_sandbox_session(cache_key: str) -> dict[str, Any]:
     key = _shared_key(udd)
     found = _live_devtools(env, user, udd)
     if found is None:
+        # Launching blind would wipe a live browser's DevToolsActivePort and lose to its singleton.
+        raise RuntimeError("the terminal backend's sandbox did not answer whether its browser is running; try again")
+    if found is GONE:
         exe = sandbox_host.chromium_executable(env)
         if not exe:
             raise RuntimeError("the sandbox image has no Chromium to run the browser")
@@ -116,6 +137,7 @@ def create_sandbox_session(cache_key: str) -> dict[str, Any]:
             _launched[key] = (env, pid)
     local_port = streams.forward_port(env, found[0], user=user)
     info = _session_record("sb", f"ws://127.0.0.1:{local_port}{found[1]}", {"local": True, "sandbox": True})
+    _confirmed[info["cdp_url"]] = (id(env), found[0], streams.forward_failures(env, found[0]))
     info.update(shared_profile=True, launcher_key=key)
     logger.info("Created sandbox browser session %s for %s", info["session_name"], cache_key)
     return info
@@ -123,26 +145,38 @@ def create_sandbox_session(cache_key: str) -> dict[str, Any]:
 
 def sandbox_browser_alive(session_info: dict[str, Any]) -> bool:
     """The sandbox Chromium still serves this session's endpoint through the current port forward: False once
-    it died, was relaunched (new DevTools path) or the sandbox was replaced (new forward)."""
+    the sandbox answers that it died, was relaunched (new DevTools path) or the sandbox was replaced (new
+    forward). Re-probed only after a connection through the forward failed; a probe that cannot reach the
+    sandbox keeps the session."""
     from tools.bot_desktop import runtime as _bd_runtime, sandbox_host
     from tools.environments import streams
     env = _bd_runtime._sandbox_env(create=False)
     if env is None:
         return False
+    cdp_url = session_info.get("cdp_url") or ""
+    confirmed = _confirmed.get(cdp_url)
+    if confirmed and confirmed[0] == id(env) and streams.forward_failures(env, confirmed[1]) == confirmed[2]:
+        return True
     try:
         user = sandbox_host._user_for(env)
-        found = _live_devtools(env, user, sandbox_host.browser_profile_dir(env))
-    except (OSError, RuntimeError) as exc:
+        udd = sandbox_host.browser_profile_dir(env)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         logger.debug("sandbox browser liveness probe failed: %s", exc)
-        return False
+        return True
+    found = _live_devtools(env, user, udd)
     if found is None:
+        return True
+    if found is GONE or cdp_url != f"ws://127.0.0.1:{streams.forward_port(env, found[0], user=user)}{found[1]}":
+        _confirmed.pop(cdp_url, None)
         return False
-    return session_info.get("cdp_url") == f"ws://127.0.0.1:{streams.forward_port(env, found[0], user=user)}{found[1]}"
+    _confirmed[cdp_url] = (id(env), found[0], streams.forward_failures(env, found[0]))
+    return True
 
 
 def stop_sandbox_browser(session_info: dict[str, Any]) -> None:
     """SIGTERM the sandbox Chromium this process launched on the session's shared key (best effort; the
     sandbox's lifetime bounds it). The caller guarantees no other live session uses it."""
+    _confirmed.pop(session_info.get("cdp_url") or "", None)
     with _launched_lock:
         launched = _launched.pop(session_info.get("launcher_key") or "", None)
     if launched is None:
