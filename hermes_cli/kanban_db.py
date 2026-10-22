@@ -873,7 +873,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Family-keyed feasibility guard (run-13 delta, rule 1): declared
+    -- strategy family of the card's feasibility invariant; NULL = the
+    -- card-title slug is used as the family default.
+    strategy_family      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -929,7 +933,16 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Family-keyed feasibility guard (run-13 delta; run-14 pins): family =
+    -- the task's strategy_family at run end (card-title slug fallback,
+    -- rule 1); terminal_signature = run-8 taxonomy bucket
+    -- (timed_out:elapsed>cap | timed_out:iteration_budget | crashed:watchdog
+    -- | rate_limited:quota_wall | <outcome>:<normalized error>). Both NULL on
+    -- legacy rows and on synthesized never-spawned runs, so neither matches
+    -- a (family, signature) count key.
+    family              TEXT,
+    terminal_signature  TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -4235,6 +4248,8 @@ from hermes_cli.kanban_db_dispatch import (
     _pid_alive,
     _record_task_failure,
     _terminate_reclaimed_worker,
+    _terminal_signature,
+    _title_family_slug,
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
