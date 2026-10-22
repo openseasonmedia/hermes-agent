@@ -358,6 +358,34 @@ def test_a_crashed_launchers_shared_browser_is_reaped_only_after_its_last_holder
         _kill_fake(pid, fake_chromium)
 
 
+@pytest.mark.platforms("posix")
+def test_a_throwaway_profile_left_by_a_process_that_died_mid_launch_is_reclaimed():
+    """A process that dies between creating its throwaway profile and writing the launch record (a first
+    launch can wait 120 s) leaves no record behind. The next reap reclaims the dir by its owner's pid and
+    start time; the dir of a live process is never touched."""
+    from hermes_constants import hermes_home_key
+    code = ("import sys\n"
+            "from tools.browser_launcher import _default_user_data_dir, _prepare_dir\n"
+            "udd = _default_user_data_dir('browser-exec-default', sys.argv[1])\n"
+            "_prepare_dir(udd, True)\n"
+            "print(udd, flush=True)\n"
+            "if sys.argv[2] == 'hold': sys.stdin.readline()\n")
+    run = dict(cwd=Path(__file__).resolve().parents[2], env=dict(os.environ), text=True)
+    died = Path(subprocess.run([sys.executable, "-c", code, hermes_home_key(), "die"], capture_output=True,
+                               check=True, **run).stdout.strip())
+    alive = subprocess.Popen([sys.executable, "-c", code, hermes_home_key(), "hold"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, **run)
+    try:
+        held = Path(alive.stdout.readline().strip())
+        assert died.is_dir() and held.is_dir() and died.parent == held.parent
+
+        launcher.reap_orphaned_browsers()
+        assert not died.exists()
+        assert held.is_dir()
+    finally:
+        alive.communicate("\n", timeout=30)
+
+
 @pytest.mark.parametrize("headed,display,expect_headless", [
     (False, ":1", True),
     (True, ":1", False),

@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -176,9 +177,13 @@ def chromium_ready() -> tuple[bool, str]:
 
 def _default_user_data_dir(key: str, home_key: str) -> str:
     """Per process too: two Hermes processes on one profile use the same keys (``browser-exec-default``,
-    named sessions), and each launch wipes its throwaway dir first."""
+    named sessions), and each launch wipes its throwaway dir first. The name carries the owner's pid and
+    start time: a process that dies before its launch record exists leaves the dir to the reaper
+    (:func:`_reclaim_throwaway_dirs`)."""
     digest = hashlib.sha256(f"{home_key}\0{key}".encode()).hexdigest()[:16]
-    return str(_ephemeral_root(home_key) / f"{digest}-{os.getpid()}")
+    pid = os.getpid()
+    started = _start_time(pid)
+    return str(_ephemeral_root(home_key) / (f"{digest}-{pid}-{started}" if started is not None else f"{digest}-{pid}"))
 
 
 def _launch_timeout(timeout: Optional[float]) -> float:
@@ -752,6 +757,31 @@ def _reap_home(home: str) -> int:
     return reaped
 
 
+_THROWAWAY_DIR = re.compile(r"^[0-9a-f]{16}-(\d+)(?:-(\d+))?$")  # _default_user_data_dir's names
+
+
+def _reclaim_throwaway_dirs(home: str) -> None:
+    """Remove ``home``'s throwaway profiles whose owning process is gone (pid and start time in the name): one
+    that died before writing its launch record left nothing else that would. The dir of a live owner is never
+    touched; a name without a start time is reclaimed only once its pid is gone."""
+    root = _ephemeral_root(home)
+    if not os.path.lexists(root) or not _is_private_dir(root):
+        return
+    from tools.browser_launcher_holders import process_alive
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        logger.debug("browser: throwaway profiles unavailable in %s: %s", root, exc)
+        return
+    for entry in entries:
+        match = _THROWAWAY_DIR.match(entry.name)
+        if match is None or int(match.group(1)) == os.getpid():
+            continue
+        if not process_alive(int(match.group(1)), int(match.group(2)) if match.group(2) else None):
+            shutil.rmtree(entry, ignore_errors=True)  # a symlink is refused, never followed
+            logger.info("browser: removed the throwaway profile %s of a Hermes process that is gone", entry)
+
+
 def _served_home_keys(homes) -> set[str]:
     """The launch profile, every profile this process launched a browser for, and ``homes``."""
     from hermes_constants import get_process_hermes_home, hermes_home_key
@@ -766,5 +796,9 @@ def reap_orphaned_browsers(homes=()) -> int:
     """Stop Chromium processes whose owning Hermes process is gone, in every profile this process serves
     (``_served_home_keys``; the janitor and atexit run outside any profile scope, so each home's records
     are read by path); returns the count. A pid is signalled only after its start time AND its
-    ``--user-data-dir`` argv token match the record."""
-    return sum(_reap_home(home) for home in sorted(_served_home_keys(homes)))
+    ``--user-data-dir`` argv token match the record. Throwaway profiles of owners that are gone go too."""
+    reaped = 0
+    for home in sorted(_served_home_keys(homes)):
+        reaped += _reap_home(home)
+        _reclaim_throwaway_dirs(home)
+    return reaped
