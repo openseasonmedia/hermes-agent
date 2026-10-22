@@ -5,7 +5,9 @@ profile shared by every key). Chromium picks its own DevTools port (``--remote-d
 and writes it to ``<user-data-dir>/DevToolsActivePort``; the CDP URL comes from that file, so there
 is no port race. Every owned launch leaves a record in its profile's private launcher state dir
 (``<HERMES_HOME>/cache/browser/chromium-records``, 0700) so a later Hermes process serving that profile
-can reap the Chromium of an owner that crashed, after proving the pid is still that browser.
+can reap the Chromium of an owner that crashed, after proving the pid is still that browser. A shared-profile
+Chromium other Hermes processes attached to is stopped only by its last holder
+(``tools/browser_launcher_holders.py``).
 
 Stop is always parent-first (``ProcessRegistry._terminate_host_pid``): Chromium reaps its own
 zygotes and renderers on SIGTERM, and killing a zygote first turns a clean exit into a crash dump.
@@ -366,7 +368,12 @@ def _attach_running(key: str, user_data_dir: str, ephemeral: bool, home_key: str
     logger.info("browser: attaching to the Chromium already running on %s (pid %s)", user_data_dir, pid)
     browser = _make_browser(key, port, path, pid=pid, start_time=_start_time(pid), user_data_dir=user_data_dir,
                             owned=False, ephemeral=False, home_key=home_key)
-    _adopt_record(browser)
+    record = _record_path(browser)
+    if record is not None:
+        from tools import browser_launcher_holders as holders
+        with holders.records_lock(record.parent):
+            _adopt_record(browser)
+            holders.write_lease(record, browser)  # its launcher's exit must not stop it under us
     return browser
 
 
@@ -382,6 +389,10 @@ def launch_chromium(key: str, *, executable: Optional[str] = None, user_data_dir
     a live Chromium on it is ATTACHED (``owned=False``, never killed). ``sandbox_bypass=False`` (the
     user's real browser) never gets the host's sandbox-bypass flags."""
     from hermes_constants import hermes_home_key
+    # Loaded now, not first at teardown: stopping the browser from an atexit hook must not be this module's
+    # first import (Python refuses new atexit registrations during shutdown, orphaning the browser). An
+    # attacher needs it too: it is the one that stops a shared browser when it is the last holder.
+    import tools.process_registry
     with _key_lock(key):  # one launch per key; other keys launch concurrently
         existing = get_browser(key)
         if existing is not None:
@@ -417,9 +428,6 @@ def _launch_owned(key: str, executable: str, udd: str, *, ephemeral: bool, packa
     if env is None:
         from tools.browser_session import build_browser_env
         env = build_browser_env()
-    # Loaded now, not first at teardown: stopping the browser from an atexit hook must not be this module's
-    # first import (Python refuses new atexit registrations during shutdown, orphaning the browser).
-    import tools.process_registry
     try:
         _prepare_dir(udd, ephemeral)
     except OSError as exc:
@@ -474,7 +482,7 @@ def get_browser(key: str) -> Optional[LaunchedBrowser]:
     return None
 
 
-def _forget(key: str, browser: LaunchedBrowser) -> None:
+def _forget(key: str, browser: LaunchedBrowser, *, drop_record: bool = True) -> None:
     _browsers.pop(key, None)
     proc = _procs.pop(key, None)
     if proc is not None:
@@ -482,7 +490,12 @@ def _forget(key: str, browser: LaunchedBrowser) -> None:
             proc.wait(timeout=0)  # reap the zombie
         except subprocess.TimeoutExpired:
             pass
-    if browser.owned:
+    if not browser.ephemeral:
+        record = _record_path(browser)
+        if record is not None:
+            from tools.browser_launcher_holders import drop_lease
+            drop_lease(record)
+    if browser.owned and drop_record:
         _remove_record(browser)
         if browser.ephemeral:
             shutil.rmtree(browser.user_data_dir, ignore_errors=True)
@@ -505,16 +518,46 @@ def _terminate(pid: Optional[int], start_time: Optional[int], proc: Optional[sub
 
 
 def stop_browser(key: str) -> None:
-    """Stop ``key``'s browser if this process launched it (an attached one is only forgotten)."""
+    """Let go of ``key``'s browser. A throwaway one this process launched is stopped. A shared-profile one is
+    stopped only by its LAST holder across Hermes processes (:func:`_last_holder_out`); one a human started is
+    never stopped."""
     with _lock:
         browser = _browsers.get(key)
         proc = _procs.get(key)
     if browser is None:
         return
-    if browser.owned:
-        _terminate(browser.pid, browser.start_time, proc)
+    record = None if browser.ephemeral else _record_path(browser)
+    if record is None:
+        if browser.owned:
+            _terminate(browser.pid, browser.start_time, proc)
+        with _lock:
+            _forget(key, browser)
+        return
+    from tools.browser_launcher_holders import records_lock
+    with records_lock(record.parent):
+        if _last_holder_out(record, browser):
+            _terminate(browser.pid, browser.start_time, proc)
+            record.unlink(missing_ok=True)
     with _lock:
-        _forget(key, browser)
+        _forget(key, browser, drop_record=False)
+
+
+def _last_holder_out(record: Path, browser: LaunchedBrowser) -> bool:
+    """Drop this process's hold on shared-profile ``browser`` (caller holds the records lock). True when it
+    must stop it now: no other live Hermes process holds it, and Hermes launched it (a launch record names
+    it). Otherwise a record this process holds, or whose owner is gone, goes to a live holder."""
+    from tools import browser_launcher_holders as holders
+    holders.drop_lease(record)
+    others = holders.other_live_holders(record, browser.start_time)
+    data = _load_record(record) if record.exists() else None
+    if data is not None and data.get("start_time") != browser.start_time:
+        data = None  # an earlier browser on a recycled pid
+    held_elsewhere = data is not None and data.get("owner_pid") != os.getpid() and _owner_alive(data)
+    if others and data is not None and not held_elsewhere:
+        holders.hand_over(record, data, others[0])
+    if others or held_elsewhere:
+        return False
+    return browser.owned or data is not None
 
 
 def stop_all_browsers(home_key: Optional[str] = None) -> None:
@@ -664,6 +707,7 @@ def _load_record(path: Path) -> Optional[dict]:
 
 
 def _reap_record(path: Path, home: str) -> bool:
+    """Caller holds the records lock."""
     record = _load_record(path)
     if record is None:
         return False
@@ -672,6 +716,11 @@ def _reap_record(path: Path, home: str) -> bool:
         _adopt_record(tracked)
         return False
     if record.get("owner_pid") != os.getpid() and _owner_alive(record):
+        return False
+    from tools import browser_launcher_holders as holders
+    others = holders.other_live_holders(path, record.get("start_time"))
+    if others:  # another live Hermes process still drives it
+        holders.hand_over(path, record, others[0])
         return False
     reaped = _is_recorded_browser(record, home)
     if reaped:
@@ -691,12 +740,16 @@ def _reap_home(home: str) -> int:
     if not _is_private_dir(records):
         logger.debug("browser: not reaping from %s: not a private directory of this user", records)
         return 0
-    try:
-        paths = sorted(records.glob("*.json"))
-    except OSError as exc:
-        logger.debug("browser: launch records unavailable in %s: %s", records, exc)
-        return 0
-    return sum(1 for path in paths if _reap_record(path, home))
+    from tools import browser_launcher_holders as holders
+    with holders.records_lock(records):
+        try:
+            paths = sorted(records.glob("*.json"))
+        except OSError as exc:
+            logger.debug("browser: launch records unavailable in %s: %s", records, exc)
+            return 0
+        reaped = sum(1 for path in paths if _reap_record(path, home))
+        holders.drop_dead_leases(records)
+    return reaped
 
 
 def _served_home_keys(homes) -> set[str]:

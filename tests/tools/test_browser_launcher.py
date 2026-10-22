@@ -7,6 +7,7 @@ launcher runs for real (spawn, readiness poll, registry, records, parent-first s
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -268,6 +269,93 @@ def test_records_of_a_live_owner_are_left_alone(tmp_path, fake_chromium):
     assert launcher.reap_orphaned_browsers() == 0
     assert launcher.get_browser("mine") is not None
     assert list(_records().glob("*.json"))
+
+
+# A Hermes process on a persistent profile: launches (or attaches to) its Chromium, prints the pid, waits
+# for a line on stdin, then exits normally (the session layer's exit teardown stops its browsers).
+_SHARED_PROFILE_USER = textwrap.dedent("""\
+    import os, sys
+    import tools.browser_session  # registers the exit teardown
+    from tools import browser_launcher as launcher
+    launcher.needs_chromium_sandbox_bypass = lambda: False
+    exe, udd, running = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    if running:  # Chromium's singleton would hand a second launch to the running instance
+        launcher.running_instance = lambda d: (45678, "/devtools/browser/fake-id", running) if d == udd else None
+    browser, err = launcher.launch_chromium("profile:" + udd, executable=exe, user_data_dir=udd, ephemeral=False,
+                                            headed=False, env=dict(os.environ), timeout=30)
+    print(f"{browser.pid} {browser.owned}" if browser else err, flush=True)
+    sys.stdin.readline()
+""")
+
+
+def _shared_profile_user(fake_chromium, udd, running: int = 0) -> tuple[subprocess.Popen, int]:
+    proc = subprocess.Popen([sys.executable, "-c", _SHARED_PROFILE_USER, str(fake_chromium), str(udd), str(running)],
+                            cwd=Path(__file__).resolve().parents[2], env=dict(os.environ), stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    line = proc.stdout.readline().split()
+    assert line and line[0].isdigit(), proc.stderr.read()[-2000:] if proc.poll() is not None else line
+    assert (line[1] == "True") is not bool(running)
+    return proc, int(line[0])
+
+
+def _gone(pid: int, timeout: float = 15) -> bool:
+    deadline = time.monotonic() + timeout
+    while launcher._pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return not launcher._pid_alive(pid)
+
+
+def _kill_fake(pid: int, fake_chromium) -> None:
+    with contextlib.suppress(OSError):
+        if str(fake_chromium) in Path(f"/proc/{pid}/cmdline").read_text(errors="replace"):
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.live_system_guard_bypass  # the fake browser is ours to stop if a leg failed
+def test_a_shared_profile_browser_outlives_its_launcher_while_another_process_holds_it(fake_chromium, tmp_path):
+    """Two Hermes processes on one persistent profile: the one that launched its Chromium lets go (its normal
+    exit) while the other still drives it. The browser stays up for the other one, and that last holder's
+    own normal exit stops it, leaving no launcher state behind."""
+    udd, key = tmp_path / "shared-profile", f"profile:{tmp_path / 'shared-profile'}"
+    mine, err = launcher.launch_chromium(key, executable=str(fake_chromium), user_data_dir=str(udd), ephemeral=False,
+                                         headed=False, env=dict(os.environ), timeout=30)
+    assert err is None and mine.owned
+    holder, _ = _shared_profile_user(fake_chromium, udd, running=mine.pid)
+    try:
+        launcher.stop_browser(key)
+        assert launcher._pid_alive(mine.pid), "the launcher let go of a browser another process still drives"
+
+        holder.communicate("\n", timeout=60)  # the last holder exits normally
+        assert _gone(mine.pid)
+        assert not [p.name for p in _records().iterdir() if not p.name.startswith(".")]
+    finally:
+        holder.kill()
+        _kill_fake(mine.pid, fake_chromium)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.live_system_guard_bypass  # the fake browser is ours to stop if a leg failed
+def test_a_crashed_launchers_shared_browser_is_reaped_only_after_its_last_holder_is_gone(fake_chromium, tmp_path):
+    """The launcher crashed while another live Hermes process holds its browser: no reaper kills it. Once
+    that holder crashed too (proven by pid + start time), the next reap stops it."""
+    udd = tmp_path / "shared-profile"
+    owner, pid = _shared_profile_user(fake_chromium, udd)
+    holder, _ = _shared_profile_user(fake_chromium, udd, running=pid)
+    try:
+        owner.kill()
+        owner.wait(timeout=10)
+        assert launcher.reap_orphaned_browsers() == 0
+        assert launcher._pid_alive(pid), "reaped while a live process still holds it"
+
+        holder.kill()
+        holder.wait(timeout=10)
+        assert launcher.reap_orphaned_browsers() == 1
+        assert _gone(pid)
+    finally:
+        owner.kill()
+        holder.kill()
+        _kill_fake(pid, fake_chromium)
 
 
 @pytest.mark.parametrize("headed,display,expect_headless", [
