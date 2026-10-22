@@ -18,10 +18,10 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _LAUNCH_TIMEOUT_S = 60.0
-# Sandbox Chromium this process launched, per shared key: ``(sandbox env, pid)``. Every session on the profile
-# attaches to it, so it is stopped only when the LAST of them tears down (release_session_backend's in-use
-# check on the shared ``launcher_key``); the env is kept so a teardown outside the owner's scope hits the
-# right sandbox.
+# Sandbox Chromium this process launched, per shared key: ``(sandbox env, pid)``. Every session in that
+# container attaches to it, whichever profile it serves, so it is stopped only when the LAST of them tears
+# down (release_session_backend's in-use check on the shared ``launcher_key``); the env is kept so a
+# teardown outside the owner's scope hits the right sandbox.
 _launched: dict[str, tuple[Any, int]] = {}
 _launched_lock = threading.Lock()
 # Endpoints a liveness probe confirmed: ``cdp_url -> (id(env), sandbox port, forward failures then)``. A browser
@@ -78,10 +78,12 @@ def _live_devtools(env, user, udd: str):
     return None
 
 
-def _shared_key(udd: str) -> str:
-    """The launcher key every session on this profile's sandbox Chromium shares (the sandbox is per profile)."""
-    from hermes_constants import hermes_home_key
-    return f"sandbox:{hermes_home_key()}:{udd}"
+def _shared_key(env, udd: str) -> str:
+    """The launcher key every session on this container's Chromium shares. Keyed by the container, never by
+    profile: profiles on one ``terminal.docker_shared_container_key`` share one browser, and each
+    ``container_persistent: false`` session has its own. The env object is the container's identity in this
+    process (its port forwards keep it alive, so the id is never reused while a session names it)."""
+    return f"sandbox:{id(env):x}:{udd}"
 
 
 def _start_chromium(env, user, exe: str, udd: str, child_env: dict) -> int:
@@ -121,7 +123,7 @@ def create_sandbox_session(cache_key: str) -> dict[str, Any]:
     env, published = _sandbox()
     user = sandbox_host._user_for(env)
     udd = sandbox_host.browser_profile_dir(env)
-    key = _shared_key(udd)
+    key = _shared_key(env, udd)
     found = _live_devtools(env, user, udd)
     if found is None:
         # Launching blind would wipe a live browser's DevToolsActivePort and lose to its singleton.

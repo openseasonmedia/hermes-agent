@@ -321,3 +321,88 @@ class TestSandboxSharedBrowser:
         for _ in range(5):
             assert bs.get_session_info("task-A") is first
         assert fake_sandbox.probes == 0
+
+
+class _FakeContainers:
+    """Several terminal sandboxes (one ``env`` object per container), each with its own Chromium."""
+
+    def __init__(self):
+        self.current = None
+        self.running = {}  # env -> pid
+        self.killed = []  # (env, pid)
+        self._next_pid = 5000
+
+    def run_in(self, env, argv, **kw):
+        cmd = " ".join(argv)
+        if "setsid" in cmd:
+            self._next_pid += 1
+            self.running.setdefault(env, self._next_pid)
+            return _Completed(0, f"{self._next_pid}\n".encode())
+        if "/dev/tcp" in cmd or argv[0] == "cat":
+            pid = self.running.get(env)
+            return _Completed(0, f"9222\n/devtools/browser/{pid}\n".encode()) if pid else _Completed(3)
+        if argv[0] == "kill":
+            self.killed.append((env, int(argv[-1])))
+            if self.running.get(env) == int(argv[-1]):
+                del self.running[env]
+            return _Completed(0)
+        return _Completed(1)
+
+
+@pytest.fixture
+def fake_containers(monkeypatch, isolated_sessions):
+    from tools import browser_session_sandbox
+    from tools.bot_desktop import runtime, sandbox_host
+    from tools.environments import streams
+    containers = _FakeContainers()
+    monkeypatch.setattr(browser_session_sandbox, "_launched", {}, raising=False)
+    monkeypatch.setattr(browser_session_sandbox, "_confirmed", {}, raising=False)
+    monkeypatch.setattr(streams, "run_in", containers.run_in)
+    monkeypatch.setattr(streams, "forward_port", lambda env, port, user=None: 50000 + id(env) % 10000)
+    monkeypatch.setattr(streams, "forward_failures", lambda env, port: 0, raising=False)
+    monkeypatch.setattr(streams, "sandbox_temp_dir", lambda env: "/tmp")  # no-tmp: ok — sandbox-side path
+    monkeypatch.setattr(runtime, "_sandbox_env", lambda create=False: containers.current)
+    monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":5"})
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda env: "hermes")
+    monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda env: "/home/hermes/.bot-browser")
+    monkeypatch.setattr(sandbox_host, "chromium_executable", lambda env: "/usr/bin/chromium")
+    return containers
+
+
+def _in_home(home, fn):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(str(home))
+    try:
+        return fn()
+    finally:
+        reset_hermes_home_override(token)
+
+
+class TestSandboxBrowserPerContainer:
+    """The sandbox Chromium belongs to its container, not to the profile that started it."""
+
+    def test_profiles_sharing_one_container_share_its_browser_until_the_last_session(self, fake_containers,
+                                                                                  isolated_sessions, tmp_path):
+        from tools.browser_session_sandbox import create_sandbox_session
+        shared = fake_containers.current = object()  # terminal.docker_shared_container_key
+        isolated_sessions["a"] = _in_home(tmp_path / "a", lambda: create_sandbox_session("a"))
+        isolated_sessions["b"] = _in_home(tmp_path / "b", lambda: create_sandbox_session("b"))
+        pid = fake_containers.running[shared]
+
+        _in_home(tmp_path / "a", lambda: lifecycle.cleanup_single_session("a"))
+        assert fake_containers.killed == [], "profile b still uses the container's browser"
+        _in_home(tmp_path / "b", lambda: lifecycle.cleanup_single_session("b"))
+        assert fake_containers.killed == [(shared, pid)]
+
+    def test_a_per_session_container_browser_stops_with_that_session(self, fake_containers, isolated_sessions):
+        from tools.browser_session_sandbox import create_sandbox_session
+        first = fake_containers.current = object()  # container_persistent: false
+        isolated_sessions["s1"] = create_sandbox_session("s1")
+        second = fake_containers.current = object()
+        isolated_sessions["s2"] = create_sandbox_session("s2")
+        pids = dict(fake_containers.running)
+
+        lifecycle.cleanup_single_session("s1")
+        assert fake_containers.killed == [(first, pids[first])]
+        lifecycle.cleanup_single_session("s2")
+        assert fake_containers.killed == [(first, pids[first]), (second, pids[second])]
